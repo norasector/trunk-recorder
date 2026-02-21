@@ -125,6 +125,7 @@ public:
 
       curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
       curl_easy_setopt(curl, CURLOPT_USERAGENT, "TrunkRecorder1.0");
+      curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
       curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headerlist);
       curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime);
       curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
@@ -224,6 +225,9 @@ public:
     }
 
     this->data.server = config_data.value("server", "");
+    while (!this->data.server.empty() && this->data.server.back() == '/') {
+      this->data.server.pop_back();
+    }
     BOOST_LOG_TRIVIAL(info) << log_prefix << "Server: " << this->data.server;
 
     boost::regex ex("(http|https)://([^/ :]+):?([^/ ]*)(/?[^ #?]*)\\x3f?([^ #]*)#?([^ ]*)");

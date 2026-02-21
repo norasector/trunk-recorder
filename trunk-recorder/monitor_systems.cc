@@ -957,7 +957,8 @@ int monitor_messages(Config &config, gr::top_block_sptr &tb, std::vector<Source 
         Source *source = *src_it;
         if (!source->got_samples()) {
           BOOST_LOG_TRIVIAL(error) << "Source " << source->get_num() << " has stopped receiving samples - Terminating trunk recorder";
-          exit(1);
+          exit_code = EXIT_FAILURE;
+          exit_flag = 1;
         }
       }
       last_decode_rate_check = current_time;

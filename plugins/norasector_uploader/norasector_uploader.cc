@@ -21,7 +21,7 @@ struct Norasector_Uploader_Data {
   std::string api_key;
 };
 
-boost::mutex curl_share_mutex;
+static boost::mutex curl_share_mutex;
 
 class Norasector_Uploader : public Plugin_Api {
   Norasector_Uploader_Data data;

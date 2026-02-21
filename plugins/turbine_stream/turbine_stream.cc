@@ -273,7 +273,29 @@ public:
       stream.TGID = element.value("TGID", (long)0);
       stream.address = element["address"];
       stream.port = element["port"];
-      stream.remote_endpoint = ip::udp::endpoint(ip::address::from_string(stream.address), stream.port);
+      {
+        ip::udp::resolver resolver(my_io_service);
+        ip::udp::resolver::query query(stream.address, std::to_string(stream.port));
+        boost::system::error_code ec;
+        auto results = resolver.resolve(query, ec);
+        if (ec || results == ip::udp::resolver::iterator()) {
+          BOOST_LOG_TRIVIAL(error) << "[turbine_stream] failed to resolve " << stream.address << ": " << ec.message();
+          continue;
+        }
+        // Prefer v6, fall back to v4-mapped-to-v6 for dual-stack socket
+        ip::udp::endpoint chosen = *results;
+        for (auto it = results; it != ip::udp::resolver::iterator(); ++it) {
+          ip::udp::endpoint ep = *it;
+          if (ep.address().is_v6()) {
+            chosen = ep;
+            break;
+          }
+        }
+        if (chosen.address().is_v4()) {
+          chosen = ip::udp::endpoint(ip::address_v6::v4_mapped(chosen.address().to_v4()), chosen.port());
+        }
+        stream.remote_endpoint = chosen;
+      }
       stream.short_name = element.value("shortName", std::string(""));
       stream.opus_bitrate = element.value("opusBitrate", opus_bitrate);
       stream.opus_frame_ms = element.value("opusFrameMs", opus_frame_ms);
@@ -290,7 +312,8 @@ public:
   }
 
   int start() {
-    my_socket.open(ip::udp::v4());
+    my_socket.open(ip::udp::v6());
+    my_socket.set_option(ip::v6_only(false));
     sender_running.store(true);
     sender_thread = std::thread(&Turbine_Stream::sender_loop, this);
     BOOST_LOG_TRIVIAL(info) << "[turbine_stream] started with " << streams.size() << " stream(s)";

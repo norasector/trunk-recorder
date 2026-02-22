@@ -1,13 +1,24 @@
 #include <curl/curl.h>
 #include <time.h>
+#include <unistd.h>
 #include <set>
 #include <vector>
+#include <fstream>
+#include <filesystem>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <queue>
+#include <thread>
 
 #include "../../trunk-recorder/call_concluder/call_concluder.h"
 #include "../../trunk-recorder/plugin_manager/plugin_api.h"
 #include "../trunk-recorder/gr_blocks/decoder_wrapper.h"
 #include <boost/dll/alias.hpp>
 #include <boost/foreach.hpp>
+#include <boost/uuid/uuid.hpp>
+#include <boost/uuid/uuid_generators.hpp>
+#include <boost/uuid/uuid_io.hpp>
 #include <sys/stat.h>
 
 struct Norasector_System {
@@ -19,6 +30,8 @@ struct Norasector_Uploader_Data {
   std::vector<Norasector_System> systems;
   std::string server;
   std::string api_key;
+  std::string local_path;
+  std::string transcribe_url;
 };
 
 static boost::mutex curl_share_mutex;
@@ -28,6 +41,17 @@ class Norasector_Uploader : public Plugin_Api {
   CURLSH *curl_share;
   long curl_dns_ttl;
   std::string plugin_name;
+
+  struct queued_call_t {
+    Call_Data_t call_info;
+    std::string correlation_id;
+  };
+
+  std::thread worker_thread;
+  std::queue<queued_call_t> work_queue;
+  std::mutex queue_mutex;
+  std::condition_variable queue_cv;
+  std::atomic<bool> worker_running{false};
 
 public:
   Norasector_System *get_system(std::string short_name) {
@@ -40,12 +64,26 @@ public:
     return NULL;
   }
 
+  // Create a staging copy of a file so the background worker owns it
+  // independently of trunk-recorder's file cleanup. Tries hardlink first
+  // (instant, no data copy), falls back to a full copy.
+  static std::string stage_file(const char *src) {
+    if (!src || src[0] == '\0') return "";
+    std::string staged = std::string(src) + ".staging";
+    if (::link(src, staged.c_str()) == 0) return staged;
+    std::error_code ec;
+    std::filesystem::copy_file(src, staged, std::filesystem::copy_options::overwrite_existing, ec);
+    if (!ec) return staged;
+    BOOST_LOG_TRIVIAL(error) << "\t[Norasector]\t" << "Failed to stage " << src << ": " << ec.message();
+    return "";
+  }
+
   static size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
     ((std::string *)userp)->append((char *)contents, size * nmemb);
     return size * nmemb;
   }
 
-  int upload(Call_Data_t call_info) {
+  int upload(Call_Data_t call_info, const std::string &correlation_id) {
     Norasector_System *sys = get_system(call_info.short_name);
 
     if (!sys) {
@@ -88,6 +126,7 @@ public:
     json_ss << ",\"timestamp\":\"" << timestamp_buf << "\"";
     json_ss << ",\"length_ms\":" << length_ms;
     json_ss << ",\"source_ids\":" << source_ids_ss.str();
+    json_ss << ",\"correlation_id\":\"" << correlation_id << "\"";
     json_ss << "}";
     std::string json_str = json_ss.str();
 
@@ -125,6 +164,7 @@ public:
 
       curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
       curl_easy_setopt(curl, CURLOPT_USERAGENT, "TrunkRecorder1.0");
+      curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
       curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
       curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headerlist);
       curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime);
@@ -210,8 +250,197 @@ public:
     return 1;
   }
 
-  int call_end(Call_Data_t call_info) {
-    return upload(call_info);
+  std::string save_local(Call_Data_t call_info) {
+    Norasector_System *sys = get_system(call_info.short_name);
+    if (!sys) {
+      return "";
+    }
+
+    std::string loghdr = log_header(call_info.short_name, call_info.call_num, call_info.talkgroup_display, call_info.freq);
+
+    struct tm tm_buf;
+    time_t start = call_info.start_time;
+    localtime_r(&start, &tm_buf);
+
+    // Build path: {localPath}/{shortName}/{YYYY}/{M}/{D}/{tgid}-{start_time}_{freq}.wav
+    std::ostringstream dir_ss;
+    dir_ss << data.local_path << "/" << call_info.short_name
+           << "/" << (tm_buf.tm_year + 1900)
+           << "/" << (tm_buf.tm_mon + 1)
+           << "/" << tm_buf.tm_mday;
+    std::string dir_path = dir_ss.str();
+
+    std::ostringstream file_ss;
+    file_ss << dir_path << "/" << call_info.talkgroup
+            << "-" << call_info.start_time
+            << "_" << (long)call_info.freq << ".wav";
+    std::string out_path = file_ss.str();
+
+    std::error_code ec;
+    std::filesystem::create_directories(dir_path, ec);
+    if (ec) {
+      BOOST_LOG_TRIVIAL(error) << loghdr << this->plugin_name << " Failed to create directory " << dir_path << ": " << ec.message();
+      return "";
+    }
+
+    std::ifstream src(call_info.filename, std::ios::binary);
+    if (!src) {
+      BOOST_LOG_TRIVIAL(error) << loghdr << this->plugin_name << " Failed to open source file: " << call_info.filename;
+      return "";
+    }
+
+    std::ofstream dst(out_path, std::ios::binary);
+    if (!dst) {
+      BOOST_LOG_TRIVIAL(error) << loghdr << this->plugin_name << " Failed to open destination file: " << out_path;
+      return "";
+    }
+
+    dst << src.rdbuf();
+
+    if (!dst.good()) {
+      BOOST_LOG_TRIVIAL(error) << loghdr << this->plugin_name << " Failed to write local file: " << out_path;
+      return "";
+    }
+
+    BOOST_LOG_TRIVIAL(info) << loghdr << this->plugin_name << " Saved local copy: " << out_path;
+    return out_path;
+  }
+
+  void notify_transcribe(Call_Data_t call_info, const std::string &local_file, const std::string &correlation_id) {
+    Norasector_System *sys = get_system(call_info.short_name);
+    if (!sys) {
+      return;
+    }
+
+    std::string loghdr = log_header(call_info.short_name, call_info.call_num, call_info.talkgroup_display, call_info.freq);
+
+    // Deduplicate source IDs
+    std::set<long> source_set;
+    for (unsigned long i = 0; i < call_info.transmission_source_list.size(); i++) {
+      source_set.insert(call_info.transmission_source_list[i].source);
+    }
+
+    std::ostringstream src_ids_ss;
+    src_ids_ss << "[";
+    bool first = true;
+    for (std::set<long>::iterator it = source_set.begin(); it != source_set.end(); ++it) {
+      if (!first) {
+        src_ids_ss << ",";
+      }
+      src_ids_ss << *it;
+      first = false;
+    }
+    src_ids_ss << "]";
+
+    std::ostringstream json_ss;
+    json_ss << "{";
+    json_ss << "\"file_path\":\"" << local_file << "\"";
+    json_ss << ",\"tgid\":" << call_info.talkgroup;
+    json_ss << ",\"system_id\":" << sys->system_id;
+    json_ss << ",\"start_time\":" << call_info.start_time;
+    json_ss << ",\"src_ids\":" << src_ids_ss.str();
+    json_ss << ",\"correlation_id\":\"" << correlation_id << "\"";
+    json_ss << "}";
+    std::string json_str = json_ss.str();
+
+    CURL *curl = curl_easy_init();
+    if (!curl) {
+      BOOST_LOG_TRIVIAL(error) << loghdr << this->plugin_name << " Failed to init curl for transcribe notify";
+      return;
+    }
+
+    std::string response_buffer;
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+
+    curl_easy_setopt(curl, CURLOPT_URL, data.transcribe_url.c_str());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_str.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_buffer);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "TrunkRecorder1.0");
+
+    CURLcode res = curl_easy_perform(curl);
+
+    if (res == CURLE_OK) {
+      long response_code;
+      curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+      BOOST_LOG_TRIVIAL(info) << loghdr << this->plugin_name << " Transcribe notify sent, response: " << response_code;
+    } else {
+      BOOST_LOG_TRIVIAL(error) << loghdr << this->plugin_name << " Transcribe notify failed: " << curl_easy_strerror(res);
+    }
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+  }
+
+  void worker_loop() {
+    while (true) {
+      queued_call_t item;
+      {
+        std::unique_lock<std::mutex> lock(queue_mutex);
+        queue_cv.wait(lock, [this] { return !work_queue.empty() || !worker_running.load(); });
+        if (work_queue.empty()) {
+          break;
+        }
+        item = work_queue.front();
+        work_queue.pop();
+      }
+
+      upload(item.call_info, item.correlation_id);
+
+      std::error_code ec;
+      std::filesystem::remove(item.call_info.converted, ec);
+
+      if (!data.local_path.empty()) {
+        std::string local_file = save_local(item.call_info);
+        std::filesystem::remove(item.call_info.filename, ec);
+        if (!local_file.empty() && !data.transcribe_url.empty()) {
+          notify_transcribe(item.call_info, local_file, item.correlation_id);
+        }
+      }
+    }
+  }
+
+  int start() override {
+    worker_running.store(true);
+    worker_thread = std::thread(&Norasector_Uploader::worker_loop, this);
+    return 0;
+  }
+
+  int stop() override {
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex);
+      worker_running.store(false);
+    }
+    queue_cv.notify_all();
+    if (worker_thread.joinable()) {
+      worker_thread.join();
+    }
+    return 0;
+  }
+
+  int call_end(Call_Data_t call_info) override {
+    // Stage files before trunk-recorder deletes them after this returns.
+    // Hardlink is instant; copy is the fallback for cross-filesystem cases.
+    if (call_info.converted[0] != '\0') {
+      std::string s = stage_file(call_info.converted);
+      if (!s.empty())
+        snprintf(call_info.converted, sizeof(call_info.converted), "%s", s.c_str());
+    }
+    if (!data.local_path.empty() && call_info.filename[0] != '\0') {
+      std::string s = stage_file(call_info.filename);
+      if (!s.empty())
+        snprintf(call_info.filename, sizeof(call_info.filename), "%s", s.c_str());
+    }
+    std::string correlation_id = boost::uuids::to_string(boost::uuids::random_generator()());
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex);
+      work_queue.push({call_info, correlation_id});
+    }
+    queue_cv.notify_one();
+    return 0;
   }
 
   int parse_config(json config_data) {
@@ -266,6 +495,22 @@ public:
     if (this->data.systems.size() == 0) {
       BOOST_LOG_TRIVIAL(error) << log_prefix << "Server set, but no systems are configured";
       return 1;
+    }
+
+    this->data.local_path = config_data.value("localPath", "");
+    while (!this->data.local_path.empty() && this->data.local_path.back() == '/') {
+      this->data.local_path.pop_back();
+    }
+    this->data.transcribe_url = config_data.value("transcribeUrl", "");
+
+    if (!this->data.local_path.empty()) {
+      BOOST_LOG_TRIVIAL(info) << log_prefix << "Local path: " << this->data.local_path;
+    }
+    if (!this->data.transcribe_url.empty()) {
+      BOOST_LOG_TRIVIAL(info) << log_prefix << "Transcribe URL: " << this->data.transcribe_url;
+      if (this->data.local_path.empty()) {
+        BOOST_LOG_TRIVIAL(warning) << log_prefix << "transcribeUrl is set but localPath is not — transcription notifications will be skipped";
+      }
     }
 
     curl_share = curl_share_init();

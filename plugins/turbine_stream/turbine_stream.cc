@@ -107,6 +107,41 @@ struct Upsampler {
   }
 };
 
+// Biquad filter (Direct Form II Transposed)
+struct Biquad {
+  float b0, b1, b2, a1, a2;
+  float z1, z2; // state
+
+  Biquad() : b0(1), b1(0), b2(0), a1(0), a2(0), z1(0), z2(0) {}
+
+  void reset() { z1 = z2 = 0; }
+
+  // Configure as high-shelf: boost frequencies above f0
+  // gain_db: amount to boost (e.g. 6.0), f0: corner frequency, fs: sample rate
+  void init_high_shelf(float gain_db, float f0, float fs) {
+    float A = sqrtf(powf(10.0f, gain_db / 20.0f));
+    float w0 = 2.0f * (float)M_PI * f0 / fs;
+    float cosw0 = cosf(w0);
+    float sinw0 = sinf(w0);
+    float alpha = sinw0 / 2.0f * sqrtf((A + 1.0f / A) * 2.0f);
+
+    float a0 =          (A + 1) - (A - 1) * cosw0 + 2 * sqrtf(A) * alpha;
+    b0 =           (A * ((A + 1) + (A - 1) * cosw0 + 2 * sqrtf(A) * alpha)) / a0;
+    b1 = (-2 * A * ((A - 1) + (A + 1) * cosw0))                             / a0;
+    b2 =           (A * ((A + 1) + (A - 1) * cosw0 - 2 * sqrtf(A) * alpha)) / a0;
+    a1 =      (2 * ((A - 1) - (A + 1) * cosw0))                             / a0;
+    a2 =           ((A + 1) - (A - 1) * cosw0 - 2 * sqrtf(A) * alpha)       / a0;
+    z1 = z2 = 0;
+  }
+
+  float process(float x) {
+    float y = b0 * x + z1;
+    z1 = b1 * x - a1 * y + z2;
+    z2 = b2 * x - a2 * y;
+    return y;
+  }
+};
+
 struct turbine_stream_t {
   long TGID;
   std::string address;
@@ -136,6 +171,7 @@ struct call_state_t {
   uint32_t src_id;
   std::string short_name;
   Upsampler upsampler;
+  Biquad high_shelf;
   int send_interval_ms;
   std::queue<queued_packet_t> packet_queue;
   std::chrono::steady_clock::time_point next_send_time;
@@ -154,6 +190,8 @@ class Turbine_Stream : public Plugin_Api {
   int opus_bitrate = 0; // 0 = OPUS_AUTO (matches turbine)
   int opus_frame_ms = 40; // 40ms frames (matches turbine)
   int opus_sample_rate = 24000;
+  float treble_boost_db = 0; // high-shelf boost in dB (0 = off)
+  float treble_freq = 1000;  // high-shelf corner frequency
 
   std::thread sender_thread;
   std::atomic<bool> sender_running{false};
@@ -267,6 +305,11 @@ public:
     opus_sample_rate = config_data.value("opusSampleRate", opus_sample_rate);
     opus_frame_ms = config_data.value("opusFrameMs", opus_frame_ms);
     opus_bitrate = config_data.value("opusBitrate", opus_bitrate);
+    treble_boost_db = config_data.value("trebleBoostDb", treble_boost_db);
+    treble_freq = config_data.value("trebleFreq", treble_freq);
+    if (treble_boost_db != 0) {
+      BOOST_LOG_TRIVIAL(info) << "[turbine_stream] treble boost: " << treble_boost_db << "dB above " << treble_freq << "Hz";
+    }
 
     for (json element : config_data["streams"]) {
       turbine_stream_t stream;
@@ -436,6 +479,9 @@ public:
       new_state.total_samples_encoded = 0;
       new_state.start_time = std::chrono::system_clock::now();
       new_state.upsampler.init(upsample_factor);
+      if (treble_boost_db != 0) {
+        new_state.high_shelf.init_high_shelf(treble_boost_db, treble_freq, (float)wav_hz);
+      }
       new_state.send_interval_ms = match_frame_ms;
       new_state.next_send_time = std::chrono::steady_clock::now();
 
@@ -506,11 +552,28 @@ public:
       }
       opus_encoder_ctl(state.encoder, OPUS_RESET_STATE);
       state.upsampler.reset();
+      state.high_shelf.reset();
       state.next_send_time = std::chrono::steady_clock::now();
     }
 
+    // Apply EQ before upsampling (operates on raw 8kHz samples)
+    std::vector<int16_t> filtered;
+    int16_t *eq_samples = samples;
+    int eq_count = sampleCount;
+    if (treble_boost_db != 0) {
+      filtered.resize(sampleCount);
+      for (int i = 0; i < sampleCount; i++) {
+        float s = state.high_shelf.process((float)samples[i]);
+        // Clamp to int16 range
+        if (s > 32767.0f) s = 32767.0f;
+        if (s < -32768.0f) s = -32768.0f;
+        filtered[i] = (int16_t)s;
+      }
+      eq_samples = filtered.data();
+    }
+
     // Upsample (if needed) and convert int16 -> float
-    state.upsampler.process(samples, sampleCount, state.buffer);
+    state.upsampler.process(eq_samples, eq_count, state.buffer);
 
     // Update metadata
     uint32_t system_id = (uint32_t)call_system->get_sys_id();

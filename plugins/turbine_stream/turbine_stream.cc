@@ -192,6 +192,7 @@ class Turbine_Stream : public Plugin_Api {
   int opus_sample_rate = 24000;
   float treble_boost_db = 0; // high-shelf boost in dB (0 = off)
   float treble_freq = 1000;  // high-shelf corner frequency
+  int send_buffer_ms = 60;   // buffer this much audio before sending the first frame
 
   std::thread sender_thread;
   std::atomic<bool> sender_running{false};
@@ -307,6 +308,7 @@ public:
     opus_bitrate = config_data.value("opusBitrate", opus_bitrate);
     treble_boost_db = config_data.value("trebleBoostDb", treble_boost_db);
     treble_freq = config_data.value("trebleFreq", treble_freq);
+    send_buffer_ms = config_data.value("sendBufferMs", send_buffer_ms);
     if (treble_boost_db != 0) {
       BOOST_LOG_TRIVIAL(info) << "[turbine_stream] treble boost: " << treble_boost_db << "dB above " << treble_freq << "Hz";
     }
@@ -483,7 +485,7 @@ public:
         new_state.high_shelf.init_high_shelf(treble_boost_db, treble_freq, (float)wav_hz);
       }
       new_state.send_interval_ms = match_frame_ms;
-      new_state.next_send_time = std::chrono::steady_clock::now();
+      new_state.next_send_time = std::chrono::steady_clock::now() + std::chrono::milliseconds(send_buffer_ms);
 
       int opus_err;
       new_state.encoder = opus_encoder_create(enc_rate, 1, OPUS_APPLICATION_VOIP, &opus_err);
@@ -519,7 +521,8 @@ public:
 
       BOOST_LOG_TRIVIAL(info) << "[turbine_stream] encoder: " << wav_hz << " -> " << enc_rate
                               << " Hz (" << upsample_factor << "x upsample), "
-                              << match_frame_ms << "ms frames (" << new_state.frame_size << " samples)";
+                              << match_frame_ms << "ms frames (" << new_state.frame_size << " samples), "
+                              << send_buffer_ms << "ms send buffer";
 
       call_states[call] = std::move(new_state);
       it = call_states.find(call);

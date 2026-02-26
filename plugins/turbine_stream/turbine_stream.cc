@@ -175,6 +175,8 @@ struct call_state_t {
   int send_interval_ms;
   std::queue<queued_packet_t> packet_queue;
   std::chrono::steady_clock::time_point next_send_time;
+  long call_num;
+  bool sending_started;
 };
 
 class Turbine_Stream : public Plugin_Api {
@@ -183,8 +185,8 @@ class Turbine_Stream : public Plugin_Api {
   ip::udp::socket my_socket{my_io_service};
 
   std::vector<turbine_stream_t> streams;
-  std::map<Call *, call_state_t> call_states;
-  std::map<long, Call *> call_num_to_ptr;
+  std::map<Recorder *, call_state_t> call_states;
+  std::map<long, Recorder *> call_num_to_recorder;
   std::mutex call_states_mutex;
 
   int opus_bitrate = 0; // 0 = OPUS_AUTO (matches turbine)
@@ -275,7 +277,11 @@ class Turbine_Stream : public Plugin_Api {
         std::lock_guard<std::mutex> lock(call_states_mutex);
         for (auto &pair : call_states) {
           call_state_t &state = pair.second;
-          if ((int)state.packet_queue.size() < send_buffer_frames) continue;
+          if (!state.sending_started) {
+            if ((int)state.packet_queue.size() < send_buffer_frames) continue;
+            state.sending_started = true;
+          }
+          if (state.packet_queue.empty()) continue;
           if (now < state.next_send_time) {
             next_wake = std::min(next_wake, state.next_send_time);
             continue;
@@ -379,31 +385,39 @@ public:
       }
     }
     call_states.clear();
-    call_num_to_ptr.clear();
+    call_num_to_recorder.clear();
     my_socket.close();
     BOOST_LOG_TRIVIAL(info) << "[turbine_stream] stopped";
     return 0;
   }
 
   int call_start(Call *call) {
+    Recorder *rec = call->get_recorder();
+    if (!rec) return 0;
     std::lock_guard<std::mutex> lock(call_states_mutex);
-    call_num_to_ptr[call->get_call_num()] = call;
+    call_num_to_recorder[call->get_call_num()] = rec;
     return 0;
   }
 
   int call_end(Call_Data_t call_info) {
     std::lock_guard<std::mutex> lock(call_states_mutex);
 
-    auto num_it = call_num_to_ptr.find(call_info.call_num);
-    if (num_it == call_num_to_ptr.end()) return 0;
+    auto num_it = call_num_to_recorder.find(call_info.call_num);
+    if (num_it == call_num_to_recorder.end()) return 0;
 
-    Call *call = num_it->second;
-    call_num_to_ptr.erase(num_it);
+    Recorder *recorder = num_it->second;
+    call_num_to_recorder.erase(num_it);
 
-    auto it = call_states.find(call);
+    auto it = call_states.find(recorder);
     if (it == call_states.end()) return 0;
 
     call_state_t &state = it->second;
+
+    // Only clean up state if it still belongs to this call.
+    // If a new call has already started on this recorder (detected in
+    // audio_stream), the state's call_num will have changed and we
+    // must not destroy the new call's active encoder.
+    if (state.call_num != call_info.call_num) return 0;
 
     // Flush remaining samples padded with silence
     if (!state.buffer.empty() && state.encoder) {
@@ -445,9 +459,34 @@ public:
     if (!any_match) return 0;
 
     long wav_hz = recorder->get_wav_hz();
+    long current_call_num = call->get_call_num();
 
     std::lock_guard<std::mutex> lock(call_states_mutex);
-    auto it = call_states.find(call);
+    auto it = call_states.find(recorder);
+
+    // Detect call transition: same recorder, different call.
+    // This happens when the GNU Radio pipeline still has buffered audio from
+    // the old call after the recorder has been reassigned to a new one.
+    if (it != call_states.end() && it->second.call_num != current_call_num) {
+      call_state_t &old_state = it->second;
+
+      // Flush remaining audio from the old call
+      if (!old_state.buffer.empty() && old_state.encoder) {
+        old_state.buffer.resize(old_state.frame_size, 0.0f);
+        encode_frames(old_state);
+      }
+      while (!old_state.packet_queue.empty()) {
+        send_packet(old_state.packet_queue.front());
+        old_state.packet_queue.pop();
+      }
+
+      if (old_state.encoder) {
+        opus_encoder_destroy(old_state.encoder);
+      }
+      call_states.erase(it);
+      it = call_states.end();
+    }
+
     if (it == call_states.end()) {
       int enc_rate = opus_sample_rate;
       if (enc_rate != 8000 && enc_rate != 12000 &&
@@ -486,6 +525,8 @@ public:
       }
       new_state.send_interval_ms = match_frame_ms;
       new_state.next_send_time = std::chrono::steady_clock::now();
+      new_state.call_num = current_call_num;
+      new_state.sending_started = false;
 
       int opus_err;
       new_state.encoder = opus_encoder_create(enc_rate, 1, OPUS_APPLICATION_VOIP, &opus_err);
@@ -524,8 +565,9 @@ public:
                               << match_frame_ms << "ms frames (" << new_state.frame_size << " samples), "
                               << send_buffer_frames << " frame send buffer";
 
-      call_states[call] = std::move(new_state);
-      it = call_states.find(call);
+      call_states[recorder] = std::move(new_state);
+      it = call_states.find(recorder);
+      call_num_to_recorder[current_call_num] = recorder;
     }
 
     call_state_t &state = it->second;
@@ -557,6 +599,7 @@ public:
       state.upsampler.reset();
       state.high_shelf.reset();
       state.next_send_time = std::chrono::steady_clock::now();
+      state.sending_started = false;
     }
 
     // Apply EQ before upsampling (operates on raw 8kHz samples)

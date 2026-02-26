@@ -32,6 +32,9 @@ namespace blocks {
 class plugin_wrapper_impl : public plugin_wrapper {
 private:
   plugin_callback d_callback;
+  bool d_enabled;
+  long d_expected_tgid;
+  bool d_conventional;
 
 protected:
   boost::mutex d_mutex;
@@ -47,6 +50,12 @@ public:
   static sptr make(plugin_callback callback);
 
   plugin_wrapper_impl(plugin_callback callback);
+
+  // Called by the recorder when a new call starts to re-enable audio forwarding.
+  void start_streaming(long tgid, bool conventional);
+
+  // Called by the recorder when a call stops.
+  void stop_streaming();
 
   virtual int work(int noutput_items,
                    gr_vector_const_void_star &input_items,

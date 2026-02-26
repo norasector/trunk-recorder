@@ -246,6 +246,9 @@ void analog_recorder::stop() {
     recording_duration += wav_sink->length_in_seconds();
     state = INACTIVE;
     set_enabled(false);
+    if (plugin_sink) {
+      plugin_sink->stop_streaming();
+    }
     wav_sink->stop_recording();
   } else {
 
@@ -383,6 +386,10 @@ bool analog_recorder::start(Call *call) {
   prefilter->tune_offset(offset_amount);
 
   wav_sink->start_recording(call);
+
+  if (plugin_sink) {
+    plugin_sink->start_streaming(call->get_talkgroup(), conventional);
+  }
 
   state = ACTIVE;
   if (conventional) {

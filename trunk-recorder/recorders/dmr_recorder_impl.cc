@@ -252,6 +252,12 @@ void dmr_recorder_impl::stop() {
 
     state = INACTIVE;
     set_enabled(false);
+    if (plugin_sink_slot0) {
+      plugin_sink_slot0->stop_streaming();
+    }
+    if (plugin_sink_slot1) {
+      plugin_sink_slot1->stop_streaming();
+    }
     wav_sink_slot0->stop_recording();
     wav_sink_slot1->stop_recording();
   } else {
@@ -284,6 +290,12 @@ bool dmr_recorder_impl::start(Call *call) {
     levels->set_k(call->get_system()->get_digital_levels());
     wav_sink_slot0->start_recording(call, 0);
     wav_sink_slot1->start_recording(call, 1);
+    if (plugin_sink_slot0) {
+      plugin_sink_slot0->start_streaming(call->get_talkgroup(), conventional);
+    }
+    if (plugin_sink_slot1) {
+      plugin_sink_slot1->start_streaming(call->get_talkgroup(), conventional);
+    }
     state = ACTIVE;
 
   if (conventional) {

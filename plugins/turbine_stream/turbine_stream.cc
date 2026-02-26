@@ -194,7 +194,7 @@ class Turbine_Stream : public Plugin_Api {
   int opus_sample_rate = 24000;
   float treble_boost_db = 0; // high-shelf boost in dB (0 = off)
   float treble_freq = 1000;  // high-shelf corner frequency
-  int send_buffer_frames = 2; // require this many queued frames before sending (jitter buffer)
+  int send_buffer_frames = 4; // require this many queued frames before sending (jitter buffer)
 
   std::thread sender_thread;
   std::atomic<bool> sender_running{false};

@@ -50,6 +50,9 @@ public:
 #else
   typedef std::shared_ptr<plugin_wrapper> sptr;
 #endif
+
+  virtual void start_streaming(long tgid, bool conventional) = 0;
+  virtual void stop_streaming() = 0;
 };
 
 } /* namespace blocks */

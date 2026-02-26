@@ -24,6 +24,9 @@ p25_recorder_decode::~p25_recorder_decode() {
 }
 
 void p25_recorder_decode::stop() {
+  if (plugin_sink) {
+    plugin_sink->stop_streaming();
+  }
   wav_sink->stop_recording();
   d_call = NULL;
 }
@@ -36,7 +39,11 @@ void p25_recorder_decode::start(Call *call) {
   } else {
     wav_sink->start_recording(call);
   }
-  
+
+  if (plugin_sink) {
+    plugin_sink->start_streaming(call->get_talkgroup(), call->get_system()->get_system_type() == "conventional" || call->get_system()->get_system_type() == "conventionalP25" || call->get_system()->get_system_type() == "conventionalDMR");
+  }
+
   d_call = call;
 }
 

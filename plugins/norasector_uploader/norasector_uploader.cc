@@ -47,7 +47,8 @@ class Norasector_Uploader : public Plugin_Api {
     std::string correlation_id;
   };
 
-  std::thread worker_thread;
+  std::vector<std::thread> worker_threads;
+  int num_workers;
   std::queue<queued_call_t> work_queue;
   std::mutex queue_mutex;
   std::condition_variable queue_cv;
@@ -375,9 +376,11 @@ public:
     curl_easy_cleanup(curl);
   }
 
-  void worker_loop() {
+  void worker_loop(int worker_id) {
+    std::string wid = "[worker " + std::to_string(worker_id) + "] ";
     while (true) {
       queued_call_t item;
+      size_t remaining;
       {
         std::unique_lock<std::mutex> lock(queue_mutex);
         queue_cv.wait(lock, [this] { return !work_queue.empty() || !worker_running.load(); });
@@ -386,6 +389,12 @@ public:
         }
         item = work_queue.front();
         work_queue.pop();
+        remaining = work_queue.size();
+      }
+
+      if (remaining > 0) {
+        std::string loghdr = log_header(item.call_info.short_name, item.call_info.call_num, item.call_info.talkgroup_display, item.call_info.freq);
+        BOOST_LOG_TRIVIAL(info) << loghdr << this->plugin_name << " " << wid << "processing, " << remaining << " still queued";
       }
 
       upload(item.call_info, item.correlation_id);
@@ -405,7 +414,11 @@ public:
 
   int start() override {
     worker_running.store(true);
-    worker_thread = std::thread(&Norasector_Uploader::worker_loop, this);
+    worker_threads.reserve(num_workers);
+    for (int i = 0; i < num_workers; i++) {
+      worker_threads.emplace_back(&Norasector_Uploader::worker_loop, this, i);
+    }
+    BOOST_LOG_TRIVIAL(info) << "\t[Norasector]\tStarted " << num_workers << " upload worker threads";
     return 0;
   }
 
@@ -415,9 +428,12 @@ public:
       worker_running.store(false);
     }
     queue_cv.notify_all();
-    if (worker_thread.joinable()) {
-      worker_thread.join();
+    for (auto &t : worker_threads) {
+      if (t.joinable()) {
+        t.join();
+      }
     }
+    worker_threads.clear();
     return 0;
   }
 
@@ -496,6 +512,11 @@ public:
       BOOST_LOG_TRIVIAL(error) << log_prefix << "Server set, but no systems are configured";
       return 1;
     }
+
+    this->num_workers = config_data.value("uploadThreads", 4);
+    if (this->num_workers < 1) this->num_workers = 1;
+    if (this->num_workers > 16) this->num_workers = 16;
+    BOOST_LOG_TRIVIAL(info) << log_prefix << "Upload threads: " << this->num_workers;
 
     this->data.local_path = config_data.value("localPath", "");
     while (!this->data.local_path.empty() && this->data.local_path.back() == '/') {

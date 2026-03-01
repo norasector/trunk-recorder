@@ -2,46 +2,254 @@
 #include "../plugin_manager/plugin_manager.h"
 #include <boost/filesystem.hpp>
 #include <filesystem>
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
 namespace fs = std::filesystem;
+
+// ---------------------------------------------------------------------------
+// Helpers for configurable filename format expansion
+// ---------------------------------------------------------------------------
+
+// Replace filesystem-unsafe characters in a token value with underscores.
+// The '/' character is NOT replaced — only the format string itself should
+// introduce path separators; token values that accidentally contain '/' will
+// be sanitised.
+static std::string sanitize_token(const std::string &str) {
+  std::string result;
+  result.reserve(str.size());
+  for (char c : str) {
+    switch (c) {
+    case '/':
+    case '\\':
+    case ':':
+    case '*':
+    case '?':
+    case '"':
+    case '<':
+    case '>':
+    case '|':
+      result += '_';
+      break;
+    default:
+      result += c;
+    }
+  }
+  return result;
+}
+
+// Format a time using strftime, with a custom %f specifier for milliseconds.
+// Since start_time is currently integer-seconds precision, milliseconds will
+// be "000".  When higher-precision timestamps are available the `ms`
+// parameter can be sourced from the fractional part.
+static std::string format_time_custom(const std::string &fmt, const struct tm *tm_val, int ms = 0) {
+  if (tm_val == nullptr || fmt.empty()) {
+    return "";
+  }
+
+  // Pre-process: replace %f with zero-padded milliseconds before strftime
+  std::string processed;
+  processed.reserve(fmt.size() + 8);
+  for (size_t i = 0; i < fmt.size(); i++) {
+    if (fmt[i] == '%' && i + 1 < fmt.size() && fmt[i + 1] == 'f') {
+      char ms_buf[4];
+      snprintf(ms_buf, sizeof(ms_buf), "%03d", std::clamp(ms, 0, 999));
+      processed += ms_buf;
+      i++; // skip 'f'
+    } else {
+      processed += fmt[i];
+    }
+  }
+
+  // Avoid fixed-size buffers: grow until strftime fits, with a hard safety cap.
+  size_t buffer_size = std::max<size_t>(64, processed.size() * 2);
+  while (buffer_size <= 65536) {
+    std::string output(buffer_size, '\0');
+    const size_t written = strftime(output.data(), output.size(), processed.c_str(), tm_val);
+    if (written > 0) {
+      output.resize(written);
+      return output;
+    }
+    buffer_size *= 2;
+  }
+
+  BOOST_LOG_TRIVIAL(warning) << "Filename time format output exceeded 64KiB or could not be formatted.";
+  return "";
+}
+
+// Expand a user-supplied filename format string by replacing {token} patterns
+// with the corresponding values from call_info / start_time.
+//
+// Supported tokens:
+//   {talkgroup}             – numeric talkgroup ID
+//   {talkgroup_tag}         – talkgroup group tag (e.g. "Law Enforcement")
+//   {talkgroup_alpha_tag}   – talkgroup alpha tag (e.g. "PD Dispatch")
+//   {talkgroup_description} – talkgroup description
+//   {talkgroup_group}       – talkgroup group name
+//   {talkgroup_display}     – formatted talkgroup display string
+//   {short_name}            – system short name
+//   {freq}                  – frequency in Hz, integer (e.g. "851012500")
+//   {freq_mhz}              – frequency in MHz, decimal (e.g. "851.0125")
+//   {call_num}              – call number
+//   {tdma_slot}             – TDMA slot (empty string when slot is -1)
+//   {sys_num}               – system number
+//   {epoch}                 – Unix epoch in seconds
+//   {source_num}            – source number
+//   {recorder_num}          – recorder number
+//   {audio_type}            – "analog", "digital", or "digital tdma"
+//   {emergency}             – 0 or 1
+//   {encrypted}             – 0 or 1
+//   {priority}              – priority value
+//   {signal}                – signal level (integer)
+//   {noise}                 – noise level (integer)
+//   {color_code}            – color code
+//   {time:FORMAT}           – strftime format in local time
+//                             FORMAT may use %f for milliseconds
+//   {ztime:FORMAT}          – strftime format in UTC (Zulu) time
+//   {time:iso}              – ISO 8601 local  (20240115T143052)
+//   {time:iso_ms}           – ISO 8601 local  (20240115T143052.000)
+//   {ztime:iso}             – ISO 8601 UTC    (20240115T143052Z)
+//   {ztime:iso_ms}          – ISO 8601 UTC    (20240115T143052.000Z)
+//
+static std::string expand_filename_format(const std::string &format,
+                                          const Call_Data_t &call_info,
+                                          time_t start_time) {
+  std::string result;
+  result.reserve(format.size() * 2);
+
+  size_t i = 0;
+  while (i < format.size()) {
+    if (format[i] == '{') {
+      size_t end = format.find('}', i);
+      if (end == std::string::npos) {
+        // Unclosed brace – copy literally
+        result += format[i];
+        i++;
+        continue;
+      }
+      std::string token = format.substr(i + 1, end - i - 1);
+
+      // ---- Call_Data_t field tokens ----
+      if (token == "talkgroup") {
+        result += std::to_string(call_info.talkgroup);
+      } else if (token == "talkgroup_tag") {
+        result += sanitize_token(call_info.talkgroup_tag);
+      } else if (token == "talkgroup_alpha_tag") {
+        result += sanitize_token(call_info.talkgroup_alpha_tag);
+      } else if (token == "talkgroup_description") {
+        result += sanitize_token(call_info.talkgroup_description);
+      } else if (token == "talkgroup_group") {
+        result += sanitize_token(call_info.talkgroup_group);
+      } else if (token == "talkgroup_display") {
+        result += sanitize_token(call_info.talkgroup_display);
+      } else if (token == "short_name") {
+        result += sanitize_token(call_info.short_name);
+      } else if (token == "freq") {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%.0f", call_info.freq);
+        result += buf;
+      } else if (token == "freq_mhz") {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%.4f", call_info.freq / 1000000.0);
+        result += buf;
+      } else if (token == "call_num") {
+        result += std::to_string(call_info.call_num);
+      } else if (token == "tdma_slot") {
+        if (call_info.tdma_slot != -1) {
+          result += std::to_string(call_info.tdma_slot);
+        }
+      } else if (token == "sys_num") {
+        result += std::to_string(call_info.sys_num);
+      } else if (token == "epoch") {
+        result += std::to_string(static_cast<long>(start_time));
+      } else if (token == "source_num") {
+        result += std::to_string(call_info.source_num);
+      } else if (token == "recorder_num") {
+        result += std::to_string(call_info.recorder_num);
+      } else if (token == "audio_type") {
+        result += sanitize_token(call_info.audio_type);
+      } else if (token == "emergency") {
+        result += std::to_string(call_info.emergency ? 1 : 0);
+      } else if (token == "encrypted") {
+        result += std::to_string(call_info.encrypted ? 1 : 0);
+      } else if (token == "priority") {
+        result += std::to_string(call_info.priority);
+      } else if (token == "signal") {
+        result += std::to_string(static_cast<int>(call_info.signal));
+      } else if (token == "noise") {
+        result += std::to_string(static_cast<int>(call_info.noise));
+      } else if (token == "color_code") {
+        result += std::to_string(call_info.color_code);
+      }
+      // ---- Local time formatting ----
+      else if (token.size() > 5 && token.substr(0, 5) == "time:") {
+        std::string fmt = token.substr(5);
+        struct tm *ltm = localtime(&start_time);
+        if (fmt == "iso") {
+          result += format_time_custom("%Y-%m-%dT%H:%M:%S", ltm);
+        } else if (fmt == "iso_ms") {
+          result += format_time_custom("%Y-%m-%dT%H:%M:%S.%f", ltm);
+        } else {
+          result += format_time_custom(fmt, ltm);
+        }
+      }
+      // ---- UTC / Zulu time formatting ----
+      else if (token.size() > 6 && token.substr(0, 6) == "ztime:") {
+        std::string fmt = token.substr(6);
+        struct tm *gtm = gmtime(&start_time);
+        if (fmt == "iso") {
+          result += format_time_custom("%Y-%m-%dT%H:%M:%SZ", gtm);
+        } else if (fmt == "iso_ms") {
+          result += format_time_custom("%Y-%m-%dT%H:%M:%S.%fZ", gtm);
+        } else {
+          result += format_time_custom(fmt, gtm);
+        }
+      }
+      // ---- Unknown token – preserve literally and warn ----
+      else {
+        result += "{" + token + "}";
+        BOOST_LOG_TRIVIAL(warning) << "Unknown filename format token: {" << token << "}";
+      }
+
+      i = end + 1;
+    } else {
+      result += format[i];
+      i++;
+    }
+  }
+
+  return result;
+}
 
 const int Call_Concluder::MAX_RETRY = 2;
 std::list<std::future<Call_Data_t>> Call_Concluder::call_data_workers = {};
 std::list<Call_Data_t> Call_Concluder::retry_call_list = {};
 
-int combine_wav(std::string files, char *target_filename) {
-  char shell_command[4000];
-
-  int nchars = snprintf(shell_command, 4000, "sox %s '%s' ", files.c_str(), target_filename);
-
-  if (nchars >= 4000) {
-    BOOST_LOG_TRIVIAL(error) << "Call uploader: SOX Combine WAV Command longer than 4000 characters";
-    return -1;
-  }
-  int rc = system(shell_command);
+int combine_wav(const std::string &files, const std::string &target_filename) {
+  const std::string shell_command = "sox " + files + " '" + target_filename + "' ";
+  int rc = system(shell_command.c_str());
 
   if (rc > 0) {
-    BOOST_LOG_TRIVIAL(info) << "Combining: " << files.c_str() << " into: " << target_filename;
+    BOOST_LOG_TRIVIAL(info) << "Combining: " << files << " into: " << target_filename;
     BOOST_LOG_TRIVIAL(info) << shell_command;
     BOOST_LOG_TRIVIAL(error) << "Failed to combine recordings, see above error. Make sure you have sox and fdkaac installed.";
     return -1;
   }
 
-  return nchars;
+  return static_cast<int>(shell_command.size());
 }
-int convert_media(char *filename, char *converted, char *date, const char *short_name, const char *talkgroup) {
-  char shell_command[400];
+int convert_media(const std::string &filename, const std::string &converted, const std::string &date, const std::string &short_name, const std::string &talkgroup) {
+  std::stringstream shell_command;
+  shell_command << "sox '" << filename << "' --norm=-.01 -t wav - | fdkaac --silent  -p 2 --date '"
+                << date << "' --artist '" << short_name << "' --title '" << talkgroup
+                << "' --moov-before-mdat --ignorelength -b 8000 -o '" << converted << "' -";
+  const std::string shell_command_string = shell_command.str();
 
-  int nchars = snprintf(shell_command, 400, "sox '%s' --norm=-.01 -t wav - | fdkaac --silent  -p 2 --date '%s' --artist '%s' --title '%s' --moov-before-mdat --ignorelength -b 8000 -o '%s' -", filename, date, short_name, talkgroup, converted);
-
-  if (nchars >= 400) {
-    BOOST_LOG_TRIVIAL(error) << "Call uploader: Command longer than 400 characters";
-    return -1;
-  }
   BOOST_LOG_TRIVIAL(trace) << "Converting: " << converted;
-  BOOST_LOG_TRIVIAL(trace) << "Command: " << shell_command;
+  BOOST_LOG_TRIVIAL(trace) << "Command: " << shell_command_string;
 
-  int rc = system(shell_command);
+  int rc = system(shell_command_string.c_str());
 
   if (rc > 0) {
     BOOST_LOG_TRIVIAL(error) << "Failed to convert call recording, see above error. Make sure you have sox and fdkaac installed.";
@@ -49,7 +257,7 @@ int convert_media(char *filename, char *converted, char *date, const char *short
   } else {
     BOOST_LOG_TRIVIAL(trace) << "Finished converting call";
   }
-  return nchars;
+  return static_cast<int>(shell_command_string.size());
 }
 
 int create_call_json(Call_Data_t& call_info) {
@@ -59,6 +267,7 @@ int create_call_json(Call_Data_t& call_info) {
   // Bools are stored as 0 or 1 as in previous versions
   // Call length is rounded up to the nearest second as in previous versions
   // Time stored in fractional seconds will omit trailing zeroes per json spec (1.20 -> 1.2)
+
   nlohmann::ordered_json json_data =
       {
           {"freq", int(call_info.freq)},
@@ -71,12 +280,15 @@ int create_call_json(Call_Data_t& call_info) {
           {"phase2_tdma", int(call_info.phase2_tdma)},
           {"start_time", call_info.start_time},
           {"stop_time", call_info.stop_time},
+          {"start_time_ms", call_info.start_time_ms},
+          {"stop_time_ms", call_info.stop_time_ms},
           {"emergency", int(call_info.emergency)},
           {"priority", call_info.priority},
           {"mode", int(call_info.mode)},
           {"duplex", int(call_info.duplex)},
           {"encrypted",int(call_info.encrypted)},
           {"call_length", int(std::round(call_info.length))},
+          {"call_length_ms", call_info.call_length_ms},
           {"talkgroup", call_info.talkgroup},
           {"talkgroup_tag", call_info.talkgroup_alpha_tag},
           {"talkgroup_description", call_info.talkgroup_description},
@@ -128,7 +340,7 @@ int create_call_json(Call_Data_t& call_info) {
   }
 }
 
-bool checkIfFile(std::string filePath) {
+bool checkIfFile(const std::string &filePath) {
   try {
     // Create a Path object from given path string
     boost::filesystem::path pathObj(filePath);
@@ -145,13 +357,10 @@ void remove_call_files(Call_Data_t call_info, bool plugin_failure=false) {
 
   if (plugin_failure) {
     std::string loghdr = log_header( call_info.short_name, call_info.call_num, call_info.talkgroup_display , call_info.freq);
-    switch (call_info.archive_files_on_failure) {
-      case true:
-        BOOST_LOG_TRIVIAL(error) << loghdr << "Upload failed after " << call_info.retry_attempt << " attempts - " <<  Color::GRN << "Archiving files" << Color::RST;
-        break;
-      case false:
-        BOOST_LOG_TRIVIAL(error) << loghdr << "Upload failed after " << call_info.retry_attempt << " attempts - " << Color::RED << "Removing files" << Color::RST;
-        break;
+    if (call_info.archive_files_on_failure) {
+      BOOST_LOG_TRIVIAL(error) << loghdr << "Upload failed after " << call_info.retry_attempt << " attempts - " <<  Color::GRN << "Archiving files" << Color::RST;
+    } else {
+      BOOST_LOG_TRIVIAL(error) << loghdr << "Upload failed after " << call_info.retry_attempt << " attempts - " << Color::RED << "Removing files" << Color::RST;
     }
   }
 
@@ -185,7 +394,7 @@ void remove_call_files(Call_Data_t call_info, bool plugin_failure=false) {
     for (std::vector<Transmission>::iterator it = call_info.transmission_list.begin(); it != call_info.transmission_list.end(); ++it) {
       Transmission t = *it;
       if (checkIfFile(t.filename)) {
-        remove(t.filename);
+        std::remove(t.filename.c_str());
       }
     }
 
@@ -194,15 +403,15 @@ void remove_call_files(Call_Data_t call_info, bool plugin_failure=false) {
   } else {
 
     if (checkIfFile(call_info.filename)) {
-      remove(call_info.filename);
+      std::remove(call_info.filename.c_str());
     }
     if (checkIfFile(call_info.converted)) {
-      remove(call_info.converted);
+      std::remove(call_info.converted.c_str());
     }
     for (std::vector<Transmission>::iterator it = call_info.transmission_list.begin(); it != call_info.transmission_list.end(); ++it) {
       Transmission t = *it;
       if (checkIfFile(t.filename)) {
-        remove(t.filename);
+        std::remove(t.filename.c_str());
       }
     }
 
@@ -210,7 +419,7 @@ void remove_call_files(Call_Data_t call_info, bool plugin_failure=false) {
 
   if (!call_info.call_log && !(plugin_failure && call_info.archive_files_on_failure)) {
     if (checkIfFile(call_info.status_filename)) {
-      remove(call_info.status_filename);
+      std::remove(call_info.status_filename.c_str());
     }
   }
 }
@@ -229,7 +438,7 @@ Call_Data_t upload_call_worker(Call_Data_t call_info) {
     for (std::vector<Transmission>::iterator it = call_info.transmission_list.begin(); it != call_info.transmission_list.end(); ++it) {
       Transmission t = *it;
 
-      if (stat(t.filename, &statbuf) == 0)
+      if (stat(t.filename.c_str(), &statbuf) == 0)
       {
           files.append("'");
           files.append(t.filename);
@@ -253,15 +462,12 @@ Call_Data_t upload_call_worker(Call_Data_t call_info) {
     if (call_info.compress_wav) {
       // TR records files as .wav files. They need to be compressed before being upload to online services.
 
-      char *talkgroup_title;
-      if (call_info.talkgroup_alpha_tag.length() > 0) {
-        talkgroup_title = (char *)call_info.talkgroup_alpha_tag.c_str();
-      } else {
-        talkgroup_title = (char *)std::to_string(call_info.talkgroup).c_str();
-      }
+      std::string talkgroup_title = call_info.talkgroup_alpha_tag.length() > 0
+                                        ? call_info.talkgroup_alpha_tag
+                                        : std::to_string(call_info.talkgroup);
 
       time_t start_time = static_cast<time_t>(call_info.start_time);
-      result = convert_media(call_info.filename, call_info.converted, std::ctime(&start_time), call_info.short_name.c_str(), talkgroup_title);
+      result = convert_media(call_info.filename, call_info.converted, std::ctime(&start_time), call_info.short_name, talkgroup_title);
 
       if (result < 0) {
         call_info.status = FAILED;
@@ -296,30 +502,64 @@ Call_Data_t upload_call_worker(Call_Data_t call_info) {
 
 
 // static int rec_counter=0;
-Call_Data_t Call_Concluder::create_base_filename(Call *call, Call_Data_t call_info) {
-  char base_filename[255];
-  time_t work_start_time = call->get_start_time();
-  std::stringstream base_path_stream;
-  tm *ltm = localtime(&work_start_time);
-  // Found some good advice on Streams and Strings here: https://blog.sensecodons.com/2013/04/dont-let-stdstringstreamstrcstr-happen.html
-  base_path_stream << call->get_capture_dir() << "/" << call->get_short_name() << "/" << 1900 + ltm->tm_year << "/" << 1 + ltm->tm_mon << "/" << ltm->tm_mday;
-  std::string base_path_string = base_path_stream.str();
-  boost::filesystem::create_directories(base_path_string);
+Call_Data_t Call_Concluder::create_base_filename(Call *call, Call_Data_t call_info, System *sys, Config config) {
+  const std::int64_t start_ms = call->get_start_time_ms();
+  time_t work_start_time = static_cast<time_t>(start_ms / 1000);
+  std::string capture_dir = call->get_capture_dir();
+  std::string base_filename;
 
-  int nchars;
-
-  if (call->get_tdma_slot() == -1) {
-    nchars = snprintf(base_filename, 255, "%s/%ld-%ld_%.0f", base_path_string.c_str(), call->get_talkgroup(), work_start_time, call->get_freq());
+  // Determine which format to use:  system-level overrides instance-level.
+  std::string filename_format;
+  if (!sys->get_filename_format().empty()) {
+    filename_format = sys->get_filename_format();
   } else {
-    // this is for the case when it is a P25P2 TDMA or DMR recorder and 2 wav files are created, the slot is needed to keep them separate.
-    nchars = snprintf(base_filename, 255, "%s/%ld-%ld_%.0f.%d", base_path_string.c_str(), call->get_talkgroup(), work_start_time, call->get_freq(), call->get_tdma_slot());
+    filename_format = config.filename_format;
   }
-  if (nchars >= 255) {
-    BOOST_LOG_TRIVIAL(error) << "Call: Path longer than 255 charecters";
+
+  if (filename_format.empty()) {
+    // ---- Legacy default behaviour (unchanged) ----
+  tm *ltm = localtime(&work_start_time);
+
+  boost::filesystem::path base_path =
+      boost::filesystem::path(call->get_capture_dir()) /
+      call->get_short_name() /
+      boost::lexical_cast<std::string>(1900 + ltm->tm_year) /
+      boost::lexical_cast<std::string>(1 + ltm->tm_mon) /
+      boost::lexical_cast<std::string>(ltm->tm_mday);
+
+  boost::filesystem::create_directories(base_path);
+    // Seconds.milliseconds from call start_time_ms
+  const long long sec   = start_ms / 1000;
+  const int       milli = static_cast<int>(start_ms % 1000);
+
+  std::ostringstream ts;
+  ts << sec << '.' << std::setw(3) << std::setfill('0') << milli;
+
+    if (call->get_tdma_slot() == -1) {
+      base_filename = base_path.string() + "/" + std::to_string(call->get_talkgroup()) + "-" +
+                      ts.str() + "_" +
+                      std::to_string(static_cast<long>(std::llround(call->get_freq())));
+    } else {
+      // this is for the case when it is a P25P2 TDMA or DMR recorder and 2 wav files are created, the slot is needed to keep them separate.
+      base_filename = base_path.string() + "/" + std::to_string(call->get_talkgroup()) + "-" +
+                      ts.str() + "_" +
+                      std::to_string(static_cast<long>(std::llround(call->get_freq()))) + "." +
+                      std::to_string(call->get_tdma_slot());
+    }
+  } else {
+    // ---- Custom user-configured format ----
+    std::string expanded = expand_filename_format(filename_format, call_info, work_start_time);
+    base_filename = capture_dir + "/" + expanded;
+
+    // Ensure the directory portion of the expanded path exists
+    boost::filesystem::path filepath(base_filename);
+    boost::filesystem::create_directories(filepath.parent_path());
+
   }
-  snprintf(call_info.filename, 300, "%s-call_%lu.wav", base_filename, call->get_call_num());
-  snprintf(call_info.status_filename, 300, "%s-call_%lu.json", base_filename, call->get_call_num());
-  snprintf(call_info.converted, 300, "%s-call_%lu.m4a", base_filename, call->get_call_num());
+
+  call_info.filename = base_filename + "-call_" + std::to_string(call->get_call_num()) + ".wav";
+  call_info.status_filename = base_filename + "-call_" + std::to_string(call->get_call_num()) + ".json";
+  call_info.converted = base_filename + "-call_" + std::to_string(call->get_call_num()) + ".m4a";
 
   return call_info;
 }
@@ -327,44 +567,56 @@ Call_Data_t Call_Concluder::create_base_filename(Call *call, Call_Data_t call_in
 
 Call_Data_t Call_Concluder::create_call_data(Call *call, System *sys, Config config) {
   Call_Data_t call_info;
-  double total_length = 0;
 
-  call_info = create_base_filename(call, call_info);
+  // ---------- Static metadata ----------
 
-  call_info.status = INITIAL;
-  call_info.process_call_time = time(0);
-  call_info.retry_attempt = 0;
-  call_info.error_count = 0;
-  call_info.spike_count = 0;
-  call_info.freq = call->get_freq();
-  call_info.freq_error = call->get_freq_error();
-  call_info.signal = call->get_signal();
-  call_info.noise = call->get_noise();
-  call_info.recorder_num = call->get_recorder()->get_num();
-  call_info.source_num = call->get_recorder()->get_source()->get_num();
-  call_info.encrypted = call->get_encrypted();
-  call_info.emergency = call->get_emergency();
-  call_info.priority = call->get_priority();
-  call_info.mode = call->get_mode();
-  call_info.duplex = call->get_duplex();
-  call_info.tdma_slot = call->get_tdma_slot();
-  call_info.phase2_tdma = call->get_phase2_tdma();
-  call_info.transmission_list = call->get_transmissions();
-  call_info.sys_num = sys->get_sys_num();
-  call_info.short_name = sys->get_short_name();
-  call_info.upload_script = sys->get_upload_script();
-  call_info.audio_archive = sys->get_audio_archive();
-  call_info.transmission_archive = sys->get_transmission_archive();
-  call_info.call_log = sys->get_call_log();
-  call_info.call_num = call->get_call_num();
-  call_info.compress_wav = sys->get_compress_wav();
-  call_info.talkgroup = call->get_talkgroup();
-  call_info.talkgroup_display = call->get_talkgroup_display();
-  call_info.patched_talkgroups = sys->get_talkgroup_patch(call_info.talkgroup);
+  call_info.status              = INITIAL;
+  call_info.process_call_time   = time(0);
+  call_info.retry_attempt       = 0;
+  call_info.error_count         = 0;
+  call_info.spike_count         = 0;
+  call_info.freq                = call->get_freq();
+  call_info.freq_error          = call->get_freq_error();
+  call_info.signal              = call->get_signal();
+  call_info.noise               = call->get_noise();
+  call_info.recorder_num        = call->get_recorder()->get_num();
+  call_info.source_num          = call->get_recorder()->get_source()->get_num();
+  call_info.encrypted           = call->get_encrypted();
+  call_info.emergency           = call->get_emergency();
+  call_info.priority            = call->get_priority();
+  call_info.mode                = call->get_mode();
+  call_info.duplex              = call->get_duplex();
+  call_info.tdma_slot           = call->get_tdma_slot();
+  call_info.phase2_tdma         = call->get_phase2_tdma();
+  call_info.transmission_list   = call->get_transmissions();
+  call_info.sys_num             = sys->get_sys_num();
+  call_info.short_name          = sys->get_short_name();
+  call_info.upload_script       = sys->get_upload_script();
+  call_info.audio_archive       = sys->get_audio_archive();
+  call_info.transmission_archive= sys->get_transmission_archive();
+  call_info.call_log            = sys->get_call_log();
+  call_info.call_num            = call->get_call_num();
+  call_info.compress_wav        = sys->get_compress_wav();
+  call_info.talkgroup           = call->get_talkgroup();
+  call_info.talkgroup_display   = call->get_talkgroup_display();
+  call_info.patched_talkgroups  = sys->get_talkgroup_patch(call_info.talkgroup);
   call_info.min_transmissions_removed = 0;
   call_info.color_code = 0;
 
   std::string loghdr = log_header( call_info.short_name, call_info.call_num, call_info.talkgroup_display , call_info.freq);
+
+
+  if (Talkgroup *tg = sys->find_talkgroup(call->get_talkgroup())) {
+    call_info.talkgroup_tag          = tg->tag;
+    call_info.talkgroup_alpha_tag    = tg->alpha_tag;
+    call_info.talkgroup_description  = tg->description;
+    call_info.talkgroup_group        = tg->group;
+  } else {
+    call_info.talkgroup_tag.clear();
+    call_info.talkgroup_alpha_tag.clear();
+    call_info.talkgroup_description.clear();
+    call_info.talkgroup_group.clear();
+  }
 
   if (call->get_is_analog()) {
     call_info.audio_type = "analog";
@@ -374,50 +626,71 @@ Call_Data_t Call_Concluder::create_call_data(Call *call, System *sys, Config con
     call_info.audio_type = "digital";
   }
 
-  if (call_info.encrypted) {
-    BOOST_LOG_TRIVIAL(info) << loghdr << Color::RED << "Encrypted call" << Color::RST << " - No audio generated";
-  }
+  // ---------- Aggregate over transmissions (ms-accurate & efficient) ----------
+  const double min_tx_s = sys->get_min_tx_duration();  // seconds
 
-  // loop through the transmission list, pull in things to fill in totals for call_info
-  // Using a for loop with iterator
-  for (std::vector<Transmission>::iterator it = call_info.transmission_list.begin(); it != call_info.transmission_list.end();) {
-    Transmission t = *it;
+  // Reserve to avoid reallocs during push_back
+  call_info.transmission_source_list.reserve(call_info.transmission_list.size());
+  call_info.transmission_error_list.reserve(call_info.transmission_list.size());
 
-    if (t.length < sys->get_min_tx_duration() && !call_info.encrypted) {
+  double        playable_pos_s = 0.0;       // "pos" field is playable timeline
+  std::int64_t  audio_sum_ms   = 0;         // sum of segment durations (playable)
+  bool          have_any       = false;
+  std::int64_t  min_start_ms   = 0;
+  std::int64_t  max_stop_ms    = 0;
+
+  for (auto it = call_info.transmission_list.begin();
+       it != call_info.transmission_list.end(); /* manual inc */) {
+
+    const Transmission &t = *it;
+
+    // Canonical length from millisecond stamps
+    const std::int64_t seg_ms   = std::max<std::int64_t>(0, t.stop_time_ms - t.start_time_ms);
+    const double       seg_len_s = seg_ms / 1000.0;
+
+    // Filter short segments using canonical length
+    if (seg_len_s < min_tx_s) {
       if (!call_info.transmission_archive) {
-        BOOST_LOG_TRIVIAL(info) << loghdr << "Removing transmission less than " << sys->get_min_tx_duration() << " seconds. Actual length: " << t.length << ".";
-        call_info.min_transmissions_removed++;
 
+        BOOST_LOG_TRIVIAL(info) << loghdr << "Removing transmission less than "
+                                << min_tx_s
+                                << " seconds. Actual length: " << seg_len_s << ".";
+        call_info.min_transmissions_removed++;
         if (checkIfFile(t.filename)) {
-          remove(t.filename);
+          std::remove(t.filename.c_str());
         }
       }
-
       it = call_info.transmission_list.erase(it);
       continue;
     }
 
-    std::string tag = sys->find_unit_tag(t.source);
-    std::string display_tag = "";
-    if (tag != "") {
-      display_tag = " (\033[0;34m" + tag + "\033[0m)";
-    }
-
-    std::stringstream transmission_info;
-    transmission_info << loghdr << "- Transmission src: " << t.source << display_tag << " pos: " << format_time(total_length) << " length: " << format_time(t.length);
-
-    if (t.error_count < 1) {
-      BOOST_LOG_TRIVIAL(info) << transmission_info.str();
+    // Track true wall-clock window [min start, max stop]
+    if (!have_any) {
+      have_any     = true;
+      min_start_ms = t.start_time_ms;
+      max_stop_ms  = t.stop_time_ms;
     } else {
-      BOOST_LOG_TRIVIAL(info) << transmission_info.str() << "\033[0;31m errors: " << t.error_count << " spikes: " << t.spike_count << "\033[0m";
+      if (t.start_time_ms < min_start_ms) min_start_ms = t.start_time_ms;
+      if (t.stop_time_ms  > max_stop_ms)  max_stop_ms  = t.stop_time_ms;
     }
 
-    if (it == call_info.transmission_list.begin()) {
-      call_info.start_time = t.start_time;
-    }
+    // Unit tag (once per segment)
+    std::string tag = sys->find_unit_tag(t.source);
+    std::string display_tag = tag.empty() ? "" : " (\033[0;34m" + tag + "\033[0m)";
 
-    if (std::next(it) == call_info.transmission_list.end()) {
-      call_info.stop_time = t.stop_time;
+    // Log with canonical length and playable position
+    {
+      std::stringstream transmission_info;
+      transmission_info << loghdr << "- Transmission src: " << t.source << display_tag
+                        << " pos: "    << format_time(playable_pos_s)
+                        << " length: " << format_time(seg_len_s);
+      if (t.error_count < 1) {
+        BOOST_LOG_TRIVIAL(info) << transmission_info.str();
+      } else {
+        BOOST_LOG_TRIVIAL(info) << transmission_info.str()
+                                << "\033[0;31m errors: " << t.error_count
+                                << " spikes: " << t.spike_count << "\033[0m";
+      }
     }
 
     if (call_info.color_code == -1 && t.color_code != -1) {
@@ -433,37 +706,48 @@ Call_Data_t Call_Concluder::create_call_data(Call *call, System *sys, Config con
     }
 
 
-    Call_Source call_source = {t.source, t.start_time, total_length, false, "", tag};
-    Call_Error call_error = {t.start_time, total_length, t.length, t.error_count, t.spike_count};
-    call_info.error_count = call_info.error_count + t.error_count;
-    call_info.spike_count = call_info.spike_count + t.spike_count;
+    // Build src/error lists aligned to playable timeline
+    Call_Source call_source = { t.source, t.start_time, playable_pos_s, false, "", tag };
+    Call_Error  call_error  = { t.start_time, playable_pos_s, seg_len_s,
+                                t.error_count, t.spike_count };
     call_info.transmission_source_list.push_back(call_source);
     call_info.transmission_error_list.push_back(call_error);
 
-    total_length = total_length + t.length;
-    it++;
+    call_info.error_count += t.error_count;
+    call_info.spike_count += t.spike_count;
+
+    playable_pos_s += seg_len_s;
+    audio_sum_ms   += seg_ms;
+
+    ++it;
   }
 
-
-
-  Talkgroup *tg = sys->find_talkgroup(call_info.talkgroup);
-  if (tg != NULL) {
-    call_info.talkgroup_tag = tg->tag;
-    call_info.talkgroup_alpha_tag = tg->alpha_tag;
-    call_info.talkgroup_description = tg->description;
-    call_info.talkgroup_group = tg->group;
+  // ---------- Finalize aggregate timing ----------
+  if (have_any) {
+    call_info.start_time_ms  = min_start_ms;                   // earliest start (ms)
+    call_info.stop_time_ms   = max_stop_ms;                    // latest stop   (ms)
+    call_info.start_time     = (time_t)(min_start_ms / 1000);
+    call_info.stop_time      = (time_t)(max_stop_ms  / 1000);
+    call_info.call_length_ms = audio_sum_ms;                   // playable audio only
+    call_info.length         = audio_sum_ms / 1000.0;          // seconds
   } else {
-    call_info.talkgroup_tag = "";
-    call_info.talkgroup_alpha_tag = "";
-    call_info.talkgroup_description = "";
-    call_info.talkgroup_group = "";
+    call_info.length         = 0.0;
+    call_info.start_time_ms  = 0;
+    call_info.stop_time_ms   = 0;
+    call_info.start_time     = 0;
+    call_info.stop_time      = 0;
+    call_info.call_length_ms = 0;
   }
+
+
+  // Generate filenames after all call_info fields (including talkgroup tags)
+  // are populated, so that custom format strings can reference any field.
+  call_info = create_base_filename(call, call_info, sys, config);
 
   call_info.archive_files_on_failure = config.archive_files_on_failure;
-  call_info.length = total_length;
-
   return call_info;
 }
+
 
 void Call_Concluder::conclude_call(Call *call, System *sys, Config config) {
   Call_Data_t call_info = create_call_data(call, sys, config);
@@ -544,4 +828,62 @@ void Call_Concluder::manage_call_data_workers() {
       it++;
     }
   }
+}
+
+bool Call_Concluder::shutdown_call_data_workers(std::chrono::seconds timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+
+  while (std::chrono::steady_clock::now() < deadline) {
+    for (std::list<std::future<Call_Data_t>>::iterator it = call_data_workers.begin(); it != call_data_workers.end();) {
+      if (it->wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+        ++it;
+        continue;
+      }
+
+      Call_Data_t call_info = it->get();
+      it = call_data_workers.erase(it);
+
+      if (call_info.status == RETRY) {
+        call_info.retry_attempt++;
+        if (call_info.retry_attempt > Call_Concluder::MAX_RETRY) {
+          remove_call_files(call_info, true);
+        } else {
+          // During shutdown, retry immediately instead of waiting for backoff.
+          call_data_workers.push_back(std::async(std::launch::async, upload_call_worker, call_info));
+        }
+      }
+    }
+
+    // Run any queued retries immediately while draining for shutdown.
+    for (std::list<Call_Data_t>::iterator it = retry_call_list.begin(); it != retry_call_list.end();) {
+      Call_Data_t call_info = *it;
+      call_data_workers.push_back(std::async(std::launch::async, upload_call_worker, call_info));
+      it = retry_call_list.erase(it);
+    }
+
+    if (call_data_workers.empty() && retry_call_list.empty()) {
+      return true;
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+
+  // Timeout hit: clean pending retries and force shutdown path to continue.
+  for (std::list<Call_Data_t>::iterator it = retry_call_list.begin(); it != retry_call_list.end(); ++it) {
+    remove_call_files(*it, true);
+  }
+  retry_call_list.clear();
+
+  if (!call_data_workers.empty()) {
+    BOOST_LOG_TRIVIAL(error) << "Call concluder shutdown timed out after "
+                             << timeout.count() << " seconds; force exiting with "
+                             << call_data_workers.size() << " worker(s) still running.";
+
+    // Keep outstanding futures alive until process exit, so we don't block on
+    // future destruction while forcing shutdown.
+    std::list<std::future<Call_Data_t>> *abandoned_workers = new std::list<std::future<Call_Data_t>>();
+    abandoned_workers->splice(abandoned_workers->end(), call_data_workers);
+  }
+
+  return false;
 }

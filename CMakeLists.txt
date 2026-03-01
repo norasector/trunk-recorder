@@ -229,6 +229,26 @@ SET(CMAKE_CXX_STANDARD 17)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread -Wno-narrowing -fvisibility=hidden -fPIC")
 
+# Eigen (used by lfsr) requires IEEE NaN/Inf semantics.
+# Strip fast/finite-math flags from toolchain/env and force safe math flags.
+foreach(_var
+    CMAKE_C_FLAGS CMAKE_CXX_FLAGS
+    CMAKE_C_FLAGS_DEBUG CMAKE_CXX_FLAGS_DEBUG
+    CMAKE_C_FLAGS_RELEASE CMAKE_CXX_FLAGS_RELEASE
+    CMAKE_C_FLAGS_RELWITHDEBINFO CMAKE_CXX_FLAGS_RELWITHDEBINFO
+    CMAKE_C_FLAGS_MINSIZEREL CMAKE_CXX_FLAGS_MINSIZEREL)
+  if(DEFINED ${_var})
+    string(REGEX REPLACE "(^| )[/-]ffast-math( |$)" " " ${_var} "${${_var}}")
+    string(REGEX REPLACE "(^| )[/-]ffinite-math-only( |$)" " " ${_var} "${${_var}}")
+    string(REGEX REPLACE "(^| )[/-]Ofast( |$)" " " ${_var} "${${_var}}")
+    set(${_var} "${${_var}}" CACHE STRING "" FORCE)
+  endif()
+endforeach()
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-finite-math-only -fno-fast-math")
+endif()
+
 
 list(APPEND trunk_recorder_sources
   trunk-recorder/recorders/recorder.cc

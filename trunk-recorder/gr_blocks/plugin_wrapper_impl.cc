@@ -81,25 +81,17 @@ int plugin_wrapper_impl::dowork(int noutput_items, gr_vector_const_void_star &in
   }
 
   // Check for stream tags that indicate call boundaries.
-  // This mirrors transmission_sink's tag processing so the streaming path
-  // stops forwarding audio at the same boundaries as the recording path.
+  // Only stop on talkgroup mismatch (frequency reassigned to a different group).
+  // Terminate tags (P25 TDU) are ignored here — they indicate a speaker
+  // releasing PTT, not the end of the call. Plugins handle speaker transitions
+  // themselves. The stream is stopped explicitly via stop_streaming() when the
+  // recorder is released.
   std::vector<gr::tag_t> tags;
-  pmt::pmt_t terminate_key(pmt::intern("terminate"));
   pmt::pmt_t grp_id_key(pmt::intern("grp_id"));
 
   get_tags_in_window(tags, 0, 0, noutput_items);
 
   for (unsigned int i = 0; i < tags.size(); i++) {
-    if (pmt::eq(terminate_key, tags[i].key)) {
-      // Send samples up to the terminate point, then stop.
-      int valid_samples = (int)(tags[i].offset - nitems_read(0));
-      if (valid_samples > 0) {
-        d_callback((int16_t *)input_items[0], valid_samples);
-      }
-      d_enabled = false;
-      return noutput_items;
-    }
-
     if (pmt::eq(grp_id_key, tags[i].key) && !d_conventional) {
       long grp_id = pmt::to_long(tags[i].value);
       if (d_expected_tgid != 0 && grp_id != d_expected_tgid) {

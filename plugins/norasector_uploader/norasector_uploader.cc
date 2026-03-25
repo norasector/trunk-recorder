@@ -1,6 +1,7 @@
 #include <curl/curl.h>
 #include <time.h>
 #include <unistd.h>
+#include <iomanip>
 #include <set>
 #include <vector>
 #include <fstream>
@@ -119,6 +120,20 @@ public:
 
     int length_ms = (int)(call_info.length * 1000);
 
+    // Build speakers JSON array (ordered timeline of who spoke when)
+    std::ostringstream speakers_ss;
+    speakers_ss << "[";
+    for (unsigned long i = 0; i < call_info.transmission_source_list.size(); i++) {
+      if (i > 0) speakers_ss << ",";
+      const Call_Source &cs = call_info.transmission_source_list[i];
+      speakers_ss << "{\"src\":" << cs.source
+                  << ",\"pos\":" << std::fixed << std::setprecision(2) << cs.position
+                  << ",\"tag\":\"" << cs.tag << "\""
+                  << ",\"emergency\":" << (cs.emergency ? "true" : "false")
+                  << "}";
+    }
+    speakers_ss << "]";
+
     // Build JSON metadata
     std::ostringstream json_ss;
     json_ss << "{";
@@ -127,6 +142,7 @@ public:
     json_ss << ",\"timestamp\":\"" << timestamp_buf << "\"";
     json_ss << ",\"length_ms\":" << length_ms;
     json_ss << ",\"source_ids\":" << source_ids_ss.str();
+    json_ss << ",\"speakers\":" << speakers_ss.str();
     json_ss << ",\"correlation_id\":\"" << correlation_id << "\"";
     json_ss << "}";
     std::string json_str = json_ss.str();
@@ -333,6 +349,20 @@ public:
     }
     src_ids_ss << "]";
 
+    // Build speakers JSON array (ordered timeline of who spoke when)
+    std::ostringstream speakers_ss;
+    speakers_ss << "[";
+    for (unsigned long i = 0; i < call_info.transmission_source_list.size(); i++) {
+      if (i > 0) speakers_ss << ",";
+      const Call_Source &cs = call_info.transmission_source_list[i];
+      speakers_ss << "{\"src\":" << cs.source
+                  << ",\"pos\":" << std::fixed << std::setprecision(2) << cs.position
+                  << ",\"tag\":\"" << cs.tag << "\""
+                  << ",\"emergency\":" << (cs.emergency ? "true" : "false")
+                  << "}";
+    }
+    speakers_ss << "]";
+
     std::ostringstream json_ss;
     json_ss << "{";
     json_ss << "\"file_path\":\"" << local_file << "\"";
@@ -340,6 +370,7 @@ public:
     json_ss << ",\"system_id\":" << sys->system_id;
     json_ss << ",\"start_time\":" << call_info.start_time;
     json_ss << ",\"src_ids\":" << src_ids_ss.str();
+    json_ss << ",\"speakers\":" << speakers_ss.str();
     json_ss << ",\"correlation_id\":\"" << correlation_id << "\"";
     json_ss << "}";
     std::string json_str = json_ss.str();
